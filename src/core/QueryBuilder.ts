@@ -1,4 +1,5 @@
 type Operator = '=' | '>' | '<' | '>=' | '<=' | '!=' | 'IN';
+type SortOption = 'DESC' | 'ASC';
 
 type Condition<T> = {
   key: keyof T;
@@ -6,10 +7,18 @@ type Condition<T> = {
   value: any;
 };
 
+type SortConfig<T> = {
+  key: keyof T;
+  direction: SortOption;
+};
+
 export class QueryBuilder<T extends Record<string, any>> {
   private data: T[];
   private conditions: Condition<T>[] = [];
   private fields: (keyof T)[] = [];
+  private sortConfig: SortConfig<T> | null = null;
+	private limitCount: number | null = null;
+	private offsetCount: number = 0;
 
   constructor(data: T[]) {
     this.data = data;
@@ -44,24 +53,33 @@ export class QueryBuilder<T extends Record<string, any>> {
   }
 
   value() {
-    let result = this.data.filter((item) =>
+    let filtered = this.data.filter((item) =>
       this.conditions.every((cond) => this.evaluate(item, cond)),
     );
 
-    if (this.fields.length === 0) {
-      return result;
-    }
+		if (this.sortConfig) {
+			filtered = this.sort(filtered);
+		}
 
-    result = result.map((item) => {
-      const newItem: Partial<T> = {};
-      this.fields.forEach((field) => {
+		if (this.offsetCount > 0) {
+			filtered = filtered.slice(this.offsetCount);
+		}
+
+		if (this.limitCount !== null) {
+			filtered = filtered.slice(0, this.limitCount);
+		}
+
+    if (this.fields.length === 0) return filtered;
+
+    return filtered.map((item) => {
+      const selected: Partial<T> = {};
+      for (const field of this.fields) {
         if (field in item) {
-          newItem[field] = item[field];
+          selected[field] = item[field];
         }
-      });
-      return newItem as T;
+      }
+      return selected as T;
     });
-    return result;
   }
 
   select(fields: (keyof T)[]) {
@@ -70,4 +88,45 @@ export class QueryBuilder<T extends Record<string, any>> {
     }
     return this;
   }
+
+	sort(data: T[]) {
+		if (!this.sortConfig) return data;
+
+		const { key, direction } = this.sortConfig;
+
+		return [...data].sort((a, b) => {
+			const valA = a[key];
+			const valB = b[key];
+			
+			if (valA == null) return 1;
+			if (valB == null) return -1;
+
+			if (valA === valB) return 0;
+
+			const comparison = valA < valB ? -1 : 1;
+
+			return direction === "ASC" ? comparison : -comparison;
+		});
+	}
+
+  orderBy(key: keyof T, direction: SortOption = "ASC") {
+    this.sortConfig = { key, direction };
+		return this;
+  }
+
+	limit(count: number) {
+		if (count < 0) {
+			throw new Error("Limit must be non-negative");
+		}
+		this.limitCount = count;
+		return this;
+	}
+
+	offset(count: number) {
+		if (count < 0) {
+			throw new Error("Offset must be non-negative");
+		}
+		this.offsetCount = count;
+		return this;
+	}
 }
