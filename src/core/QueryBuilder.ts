@@ -2,7 +2,8 @@ type Operator = '=' | '>' | '<' | '>=' | '<=' | '!=' | 'IN';
 type SortOption = 'DESC' | 'ASC';
 
 /**
- * Represents a WHERE condition in the query.
+ * Represents a single WHERE condition.
+ * Example: { key: "age", operator: ">", value: 25 }
  */
 type Condition<T> = {
   key: keyof T;
@@ -11,7 +12,7 @@ type Condition<T> = {
 };
 
 /**
- * Represents sorting configuration.
+ * Represents ORDER BY configuration.
  */
 type SortConfig<T> = {
   key: keyof T;
@@ -19,39 +20,73 @@ type SortConfig<T> = {
 };
 
 /**
- * QueryBuilder provides a SQL-like query interface
+ * QueryBuilder provides a SQL-like in-memory query engine
  * for arrays of objects.
+ *
+ * Internal logical model:
+ * - conditionGroups: OR groups of AND conditions (DNF form)
+ * - DISTINCT is applied before SELECT
+ * - Mutation operations (update/delete) reuse same condition logic
  */
 export class QueryBuilder<T extends Record<string, any>> {
   private data: T[];
-  private conditions: Condition<T>[] = [];
+
+  /**
+   * conditionGroups structure:
+   * [
+   *   [A, B],   // A AND B
+   *   [C]       // OR C
+   * ]
+   *
+   * Logical meaning:
+   * (A AND B) OR (C)
+   */
+  private conditionGroups: Condition<T>[][] = [[]];
+
   private fields: (keyof T)[] = [];
   private sortConfig: SortConfig<T> | null = null;
   private limitCount: number | null = null;
   private offsetCount: number = 0;
 
   /**
-   * Initializes the QueryBuilder with data.
-   * @param data Array of objects to query.
+   * DISTINCT is field-based.
+   * Null means no distinct applied.
    */
+  private distinctField: keyof T | null = null;
+
   constructor(data: T[]) {
     this.data = data;
   }
 
   /**
-   * Adds a WHERE condition.
-   * Multiple calls are combined using AND logic.
-   * 
-   * Example:
-   * .where("age", ">", 25)
+   * Adds condition to the current AND group.
    */
   where(key: keyof T, operator: Operator, value: any) {
-    this.conditions.push({ key, operator, value });
+    const currentGroup =
+      this.conditionGroups[this.conditionGroups.length - 1];
+
+    currentGroup?.push({ key, operator, value });
     return this;
   }
 
   /**
-   * Evaluates a single condition against an item.
+   * Starts a new OR group.
+   * If called first, behaves like where().
+   */
+  orWhere(key: keyof T, operator: Operator, value: any) {
+    if (
+      this.conditionGroups.length === 1 &&
+      this.conditionGroups[0]?.length === 0
+    ) {
+      return this.where(key, operator, value);
+    }
+
+    this.conditionGroups.push([{ key, operator, value }]);
+    return this;
+  }
+
+  /**
+   * Evaluates a single condition.
    */
   private evaluate(item: T, cond: Condition<T>) {
     const val = item[cond.key];
@@ -77,61 +112,101 @@ export class QueryBuilder<T extends Record<string, any>> {
   }
 
   /**
-   * Executes the query and returns the final result.
-   * 
-   * Execution order:
-   * WHERE → ORDER BY → OFFSET → LIMIT → SELECT
+   * Executes the query.
+   *
+   * Execution pipeline:
+   * WHERE → ORDER BY → OFFSET → LIMIT → DISTINCT → SELECT
    */
   value() {
-    // Apply WHERE conditions
-    let filtered = this.data.filter((item) =>
-      this.conditions.every((cond) => this.evaluate(item, cond)),
+    let filtered = this.data;
+
+    /**
+     * Apply WHERE logic using Disjunctive Normal Form:
+     * OR groups of AND conditions.
+     */
+    const hasConditions = this.conditionGroups.some(
+      group => group.length > 0
     );
 
-    // Apply ORDER BY
+    if (hasConditions) {
+      filtered = this.data.filter(item =>
+        this.conditionGroups.some(group =>
+          group.length > 0 &&
+          group.every(cond => this.evaluate(item, cond))
+        )
+      );
+    }
+
+    /**
+     * ORDER BY does not mutate original dataset.
+     */
     if (this.sortConfig) {
       filtered = this.sort(filtered);
     }
 
-    // Apply OFFSET
+    /**
+     * OFFSET removes first N rows.
+     */
     if (this.offsetCount > 0) {
       filtered = filtered.slice(this.offsetCount);
     }
 
-    // Apply LIMIT
+    /**
+     * LIMIT restricts result size.
+     */
     if (this.limitCount !== null) {
       filtered = filtered.slice(0, this.limitCount);
     }
 
-    // If no SELECT fields specified, return full objects
+    /**
+     * DISTINCT (field-based).
+     * Keeps first occurrence of each unique field value.
+     * Stable order is preserved.
+     */
+    if (this.distinctField !== null) {
+      const seen = new Set<any>();
+
+      filtered = filtered.filter(item => {
+        const value = item[this.distinctField!];
+
+        if (seen.has(value)) return false;
+
+        seen.add(value);
+        return true;
+      });
+    }
+
+    /**
+     * If no projection requested, return full objects.
+     */
     if (this.fields.length === 0) return filtered;
 
-    // Apply SELECT projection
-    return filtered.map((item) => {
+    /**
+     * SELECT projection (output shaping).
+     */
+    return filtered.map(item => {
       const selected: Partial<T> = {};
+
       for (const field of this.fields) {
         selected[field] = item[field];
       }
+
       return selected as T;
     });
   }
 
   /**
-   * Select specific fields (projection).
-   * 
-   * Example:
-   * .select(["name", "age"])
+   * Specifies projection fields.
    */
   select(fields: (keyof T)[]) {
-    if (fields && fields.length) {
+    if (fields?.length) {
       this.fields = fields;
     }
     return this;
   }
 
   /**
-   * Internal sorting logic.
-   * Creates a new sorted array without mutating original data.
+   * Internal sorting implementation.
    */
   private sort(data: T[]) {
     if (!this.sortConfig) return data;
@@ -144,52 +219,99 @@ export class QueryBuilder<T extends Record<string, any>> {
 
       if (valA == null) return 1;
       if (valB == null) return -1;
-
       if (valA === valB) return 0;
 
       const comparison = valA < valB ? -1 : 1;
 
-      return direction === "ASC" ? comparison : -comparison;
+      return direction === 'ASC' ? comparison : -comparison;
     });
   }
 
-  /**
-   * Adds ORDER BY clause.
-   * Default direction is ASC.
-   * 
-   * Example:
-   * .orderBy("age", "DESC")
-   */
-  orderBy(key: keyof T, direction: SortOption = "ASC") {
+  orderBy(key: keyof T, direction: SortOption = 'ASC') {
     this.sortConfig = { key, direction };
     return this;
   }
 
-  /**
-   * Limits the number of returned records.
-   * 
-   * Example:
-   * .limit(10)
-   */
   limit(count: number) {
     if (count < 0) {
-      throw new Error("Limit must be non-negative");
+      throw new Error('Limit must be non-negative');
     }
     this.limitCount = count;
     return this;
   }
 
-  /**
-   * Skips the first N records.
-   * 
-   * Example:
-   * .offset(20)
-   */
   offset(count: number) {
     if (count < 0) {
-      throw new Error("Offset must be non-negative");
+      throw new Error('Offset must be non-negative');
     }
     this.offsetCount = count;
     return this;
+  }
+
+  /**
+   * Inserts one or multiple records.
+   */
+  insert(record: T | T[]) {
+    if (Array.isArray(record)) {
+      this.data.push(...record);
+    } else {
+      this.data.push(record);
+    }
+    return this;
+  }
+
+  /**
+   * Updates records matching condition logic.
+   */
+  update(updates: Partial<T>) {
+    this.data = this.data.map(item => {
+      const matches = this.conditionGroups.some(group =>
+        group.length > 0 &&
+        group.every(cond => this.evaluate(item, cond))
+      );
+
+      return matches ? { ...item, ...updates } : item;
+    });
+
+    this.reset();
+    return this;
+  }
+
+  /**
+   * Deletes records matching condition logic.
+   */
+  delete() {
+    this.data = this.data.filter(item => {
+      const matches = this.conditionGroups.some(group =>
+        group.length > 0 &&
+        group.every(cond => this.evaluate(item, cond))
+      );
+
+      return !matches;
+    });
+
+    this.reset();
+    return this;
+  }
+
+  /**
+   * Enables field-based DISTINCT.
+   */
+  distinct(key: keyof T) {
+    this.distinctField = key;
+    return this;
+  }
+
+  /**
+   * Resets query state (not data).
+   * Maintains invariant: always one empty condition group.
+   */
+  reset() {
+    this.conditionGroups = [[]];
+    this.fields = [];
+    this.sortConfig = null;
+    this.limitCount = null;
+    this.offsetCount = 0;
+    this.distinctField = null;
   }
 }
